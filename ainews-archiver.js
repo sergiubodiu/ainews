@@ -1,12 +1,21 @@
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const TurndownService = require('turndown');
 
-async function cleanText(text) {
-  return text.trim().replace(/\u200b/g, ''); // remove zero-width spaces
+function extractDateFromUrl(url) {
+  // Match patterns like 26-03-05, 26-04-01, etc.
+  const match = url.match(/26-(\d{2})-(\d{2})/);
+  if (match) {
+    const month = match[1];
+    const day = match[2];
+    return `2026-${month}-${day}`;
+  }
+  // Fallback: use today's date
+  return new Date().toISOString().split('T')[0];
 }
 
-async function extractAINewsIssue(url, outputDir = 'ainews_archive') {
+async function extractAndConvertToMarkdown(url, outputDir = 'archive') {
   if (!fs.existsSync(outputDir)) {
     fs.mkdirSync(outputDir, { recursive: true });
   }
@@ -16,103 +25,110 @@ async function extractAINewsIssue(url, outputDir = 'ainews_archive') {
 
   console.log(`🌐 Loading: ${url}`);
   await page.goto(url, { waitUntil: 'networkidle' });
+  await page.waitForSelector('h1', { timeout: 20000 });
 
-  // Wait for main content
-  await page.waitForSelector('h1', { timeout: 15000 });
+  const pageTitle = (await page.locator('h1').first().innerText()).trim();
 
-  const title = await page.locator('h1').first().innerText();
+  // Extract date from URL (preferred) or fallback
+  const issueDate = extractDateFromUrl(url);
 
-  // Intro blockquote
-  let intro = '';
-  const blockquote = page.locator('blockquote').first();
-  if (await blockquote.count() > 0) {
-    intro = await blockquote.innerText();
-  }
+  // Extract HTML between first <hr> and "AI Discords"
+  const rawHTML = await page.evaluate(() => {
+    const hrs = document.querySelectorAll('hr');
+    if (hrs.length === 0) return document.body.innerHTML;
 
-  // Extract all relevant elements in order (better structure than raw text)
-  const elements = await page.locator('h1, h2, h3, h4, p, blockquote, ul, ol, li').all();
+    const firstHr = hrs[0];
+    let current = firstHr.nextElementSibling;
+    let htmlBlocks = [];
 
-  let markdownContent = '';
-  let currentSection = '';
+    while (current) {
+      const text = (current.innerText || '').toLowerCase();
 
-  for (const el of elements) {
-    const tag = await el.evaluate(e => e.tagName.toLowerCase());
-    let text = await cleanText(await el.innerText());
+      // Stop before AI Discords section
+      if (text.includes('ai discords') || text.includes('discord')) {
+        break;
+      }
 
-    if (!text) continue;
-
-    if (tag.startsWith('h')) {
-      const level = parseInt(tag[1]);
-      if (currentSection) markdownContent += currentSection + '\n';
-      currentSection = `${'#'.repeat(level)} ${text}\n\n`;
-    } 
-    else if (tag === 'p' || tag === 'blockquote') {
-      currentSection += `${text}\n\n`;
-    } 
-    else if (tag === 'ul' || tag === 'ol') {
-      // innerText on lists usually preserves bullets reasonably
-      currentSection += `${text}\n\n`;
-    } 
-    else if (tag === 'li') {
-      currentSection += `- ${text}\n`;
+      // Collect useful elements
+      if (current.tagName.match(/^(H1|H2|P|UL|OL|BLOCKQUOTE|DIV)$/i)) {
+        htmlBlocks.push(current.outerHTML);
+      }
+      current = current.nextElementSibling;
     }
-  }
+    return htmlBlocks.join('\n');
+  });
 
-  if (currentSection) markdownContent += currentSection;
+  // === Turndown Setup with custom rules ===
+  const turndownService = new TurndownService({
+    headingStyle: 'atx',
+    codeBlockStyle: 'fenced',
+    bulletListMarker: '-',
+  });
 
-  // Build final Markdown
+  // Custom rule: Convert thematic bold paragraphs into ## headings
+  turndownService.addRule('thematicHeading', {
+    filter: function (node) {
+      return node.nodeName === 'P' &&
+        node.querySelector('strong') &&
+        node.innerText.length > 35 &&
+        node.innerText.length < 140;
+    },
+    replacement: function (content) {
+      const clean = content.replace(/\*\*/g, '').trim();
+      return `## ${clean}\n\n`;
+    }
+  });
+
+  // Custom rule: Convert "**Title:**" style into ###
+  turndownService.addRule('subHeading', {
+    filter: function (node) {
+      return node.nodeName === 'P' && /^\*\*[^*]{5,80}\*\*[:\s]/.test(node.innerText);
+    },
+    replacement: function (content) {
+      const clean = content.replace(/\*\*/g, '').replace(/:\s*$/, '').trim();
+      return `### ${clean}\n\n`;
+    }
+  });
+
+  // Convert HTML to Markdown
+  let markdown = turndownService.turndown(rawHTML);
+
+  // Additional cleanup
+  markdown = markdown
+    .replace(/Apr \d+\s+not much happened today/gi, '')
+    .replace(/show\/hide tags/gi, '')
+    .replace(/### Companies[\s\S]*?### People[\s\S]*?/i, '')
+    .replace(/\n{4,}/g, '\n\n\n')
+    .trim();
+
+  // Final Markdown with header
   const today = new Date().toISOString().split('T')[0];
-  let slug = title.toLowerCase()
+  const slug = pageTitle.toLowerCase()
     .replace(/[^a-z0-9\s-]/g, '')
     .replace(/\s+/g, '-')
     .slice(0, 100);
 
-  const md = `# ${title}
+  const finalMd = `# ${pageTitle}
 
-**Source URL:** ${url}  
-**Extracted on:** ${today}
 
-${intro ? intro + '\n\n' : ''}
-
-${markdownContent}
+${markdown}
 `;
 
-  const filename = `${today}-${slug}.md`;
+  const filename = `${issueDate}.md`;
   const filepath = path.join(outputDir, filename);
 
-  fs.writeFileSync(filepath, md, 'utf-8');
+  fs.writeFileSync(filepath, finalMd, 'utf-8');
 
-  console.log(`✅ Saved: ${filepath}`);
-
+  console.log(`✅ Final clean Markdown saved: ${filepath}`);
   await browser.close();
-  return filepath;
 }
 
-// ======================
-// Run the script
-// ======================
-
 (async () => {
-  let targetUrl;
-
-  if (process.argv[2]) {
-    targetUrl = process.argv[2];
-  } else {
-    console.log("No URL provided → fetching latest issue from homepage...");
-    const browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
-    await page.goto('https://ainews-web-2025.vercel.app/', { waitUntil: 'networkidle' });
-
-    const latestLink = page.locator('a[href^="/issues/"]').first();
-    if (await latestLink.count() > 0) {
-      const href = await latestLink.getAttribute('href');
-      targetUrl = `https://ainews-web-2025.vercel.app${href}`;
-      console.log(`Latest issue: ${targetUrl}`);
-    } else {
-      targetUrl = 'https://ainews-web-2025.vercel.app/issues/26-04-08-not-much'; // fallback
-    }
-    await browser.close();
+  let targetUrl = process.argv[2];
+  if (!targetUrl) {
+    targetUrl = "https://ainews-web-2025.vercel.app/issues/26-04-08-not-much";
+    console.log("No URL provided → using default issue");
   }
 
-  await extractAINewsIssue(targetUrl);
+  await extractAndConvertToMarkdown(targetUrl);
 })();
